@@ -1,0 +1,571 @@
+================================================================
+  PROJECT NOTES — Agentic AI Assistant for Organizational
+  Knowledge Retrieval (Moodle AI Assistant, NMIT)
+================================================================
+
+----------------------------------------------------------------
+0. WHAT THIS PROJECT DOES (one-paragraph summary)
+----------------------------------------------------------------
+It is a college "knowledge assistant" chatbot. A user logs in with an
+ID (e.g. a student USN, FAC001, ADM001). They type a question in plain
+English ("who is my mentor", "show my attendance", "explain neural
+networks"). The backend figures out (a) the user's role, (b) what the
+question is about, and (c) whether it needs college data or just a
+general answer. If it needs data, it reads a student CSV file and
+answers with real records. If it is a general/conceptual question, it
+asks an LLM (LLaMA 3.3 running on Groq). The whole thing is wrapped in
+a FastAPI server, has a web UI, can export answers to PDF/Word/Excel,
+and ships in a Docker container.
+
+Data source: a students CSV (students_500.csv). From each student row
+the code DERIVES extra fields — mentor, attendance %, backlogs, and
+enrolled courses — using simple rules (see csv_db.py). So a lot of the
+"data" is computed, not stored.
+
+Main files:
+  main.py              -> FastAPI server + routes + Groq calls
+  agentic_workflow.py  -> the multi-agent orchestrator (the core)
+  classifier.py        -> decides general vs organizational query
+  intent_agent.py      -> refines the intent using the CSV
+  csv_db.py            -> reads CSV, derives mentor/attendance/backlogs
+  data_retriever.py    -> pulls the right data for an intent
+  data_agents.py       -> routes an intent to its data agent
+  mcp_csv_server.py    -> exposes the data functions as MCP-style tools
+  rbac.py              -> roles + permissions (role detection)
+  response_formatter.py-> PDF / Word / Excel / TXT export
+  static/index.html    -> web frontend
+  auth.py, db.py, spreadsheet_db.py -> LEGACY (not in the live flow)
+
+================================================================
+  ANSWERS TO YOUR QUESTIONS
+================================================================
+
+----------------------------------------------------------------
+1. What is FastAPI? What is it used for in the project?
+----------------------------------------------------------------
+FastAPI is a modern Python framework for building web APIs (HTTP
+servers). You define functions, decorate them with the URL path, and
+it handles requests, JSON, validation, and async for you.
+
+In THIS project it is the whole backend (main.py). It exposes the
+endpoints the frontend calls:
+  POST /ask            -> the main chat endpoint (question in, answer out)
+  POST /login          -> resolve a user ID to a role + context
+  GET  /health         -> status check (used by Render)
+  GET  /user-context/{id}
+  POST /mentor/assign  -> assign a mentor to a student
+  GET  /mcp/tools, POST /mcp/call -> inspect/call the internal tools
+It also validates every request body with Pydantic models
+(AskRequest, LoginRequest, etc.) and serves the HTML frontend.
+
+----------------------------------------------------------------
+2. What is Groq? Why is it used? For what reason?
+----------------------------------------------------------------
+Groq is a company that runs large language models on very fast
+specialized hardware, offered through an API. This project uses Groq
+to run the model "llama-3.3-70b-versatile" (LLaMA 3.3, 70 billion
+parameters). It is chosen because it is fast and has a free API tier.
+
+It is used in TWO places (see agentic_workflow.py):
+  (a) General/conceptual questions -> the answer comes straight from
+      the LLM (e.g. "explain neural networks").
+  (b) Complex data questions the fixed templates can't handle -> the
+      retrieved CSV data is handed to the LLM, which writes the final
+      natural-language answer ("composer" step).
+For simple, known data questions the project does NOT use Groq — it
+builds the answer from templates (this is the "hybrid" idea, see Q9).
+
+----------------------------------------------------------------
+3. What is n8n?
+----------------------------------------------------------------
+n8n is an open-source, visual workflow-automation tool. You drag and
+connect "nodes" (triggers, HTTP calls, conditions, integrations) to
+automate tasks without writing much code — similar in spirit to Zapier.
+
+HONEST NOTE: n8n is listed in the resume tech stack, but there is NO
+n8n anywhere in this repository (I searched the whole codebase — zero
+references). If someone asks to see the n8n workflow there is nothing
+to show. Either add a small real n8n flow, or remove it from the
+resume so you are not caught out.
+
+----------------------------------------------------------------
+4. What is Docker? How is it used here?
+----------------------------------------------------------------
+Docker packages an app plus everything it needs (Python version,
+libraries, config) into a single "container image" that runs the same
+way on any machine — so "works on my laptop" also works on the server.
+
+Here (Dockerfile):
+  - Starts from python:3.11-slim
+  - Copies requirements.txt and installs the Python packages
+  - Copies the code
+  - Exposes port 8000 and runs: uvicorn main:app
+render.yaml then tells the Render cloud platform to build and deploy
+this Docker image as a web service (env: docker), with /health as the
+health check. So Docker is used for packaging + cloud deployment.
+
+----------------------------------------------------------------
+5. What does "multi-agent system" mean? What does each agent do?
+----------------------------------------------------------------
+"Multi-agent" here means the work is split into several small,
+single-purpose steps ("agents") that run one after another in a
+pipeline. They are NOT independent AIs talking to each other — they
+are ordered stages, each doing one job and recording a "trace" step so
+the UI can show what happened. The agents (agentic_workflow.py):
+
+  1. Role Guard agent  -> works out the user's role from their ID
+                          (ADM=admin, FAC=faculty, USN=student).
+  2. Context agent     -> loads role-scoped info (their profile /
+                          dashboard context) from the CSV.
+  3. Intent agent      -> figures out what the question is about
+                          (attendance? mentor? profile? general?) and
+                          corrects it against the CSV.
+  4. Data Router agent -> picks which data agent should handle this
+                          intent.
+  5. Data agent        -> the specialist that actually fetches the
+                          data for that intent (profile / grades /
+                          attendance / mentor / backlog / count / etc.).
+  6a. Executor agent   -> for KNOWN intents, builds the answer from a
+                          template — no LLM (fast, exact).
+  6b. Composer agent   -> for COMPLEX/UNKNOWN intents, sends the data
+                          to the LLM to write the answer.
+(For a purely general question, steps 4-6 are replaced by a single
+"Knowledge agent" that just asks the LLM directly.)
+
+----------------------------------------------------------------
+6. How is the data retrieved and responses generated?
+----------------------------------------------------------------
+RETRIEVAL:
+  - csv_db.py loads students_500.csv (cached) and, for each row,
+    derives extra fields with simple rules: mentor (picked from a
+    fixed list), attendance % (a formula based on CGPA/semester/id),
+    backlogs (based on CGPA thresholds), and courses (from a semester
+    catalog).
+  - Once the intent is known, data_agents.py routes to the right
+    agent, which calls retrieve_data() in data_retriever.py. That
+    function returns a "summary" object tailored to the intent
+    (e.g. attendance_summary, mentor_summary, backlog_summary).
+  - These data functions are also exposed as MCP-style tools in
+    mcp_csv_server.py (retrieve_data, get_user_context).
+
+RESPONSE GENERATION (two ways — see Q9):
+  - Known intent -> _structured_answer() in agentic_workflow.py fills
+    a text template with the summary values. No LLM. Deterministic.
+  - Complex/general intent -> the summary (or the raw question) is
+    sent to Groq/LLaMA, which writes the answer in natural language.
+Finally response_formatter.py can turn the answer into TXT/PDF/Word/
+Excel if the user asked for a download, and main.py keeps a short
+in-memory chat history per user so it remembers the conversation.
+
+----------------------------------------------------------------
+7. What does "orchestration pipeline" mean?
+----------------------------------------------------------------
+"Orchestration" = one controller function that calls the agents in the
+correct order, passes each one's output to the next, handles the
+branches, and collects the results. Here that controller is
+run_agentic_workflow() in agentic_workflow.py. "Pipeline" = the fixed
+sequence they run in: role -> context -> intent -> route -> data ->
+answer. It also builds the "trace" list so the frontend can display
+every step that ran. So the phrase just means: a single coordinator
+running a fixed chain of steps.
+
+----------------------------------------------------------------
+8. What is Role-Based Access Control (RBAC)?
+----------------------------------------------------------------
+RBAC means what a user is allowed to do depends on their ROLE, not on
+them individually. Define roles, give each role a set of permissions,
+then check the permission before acting.
+
+In this project (rbac.py):
+  - Roles: admin, faculty, student, unknown.
+  - Each role has a permission set (e.g. student = view_own_data +
+    general_query; admin = view everything + assign_mentor).
+  - Role is detected from the ID pattern (ADM* / FAC* / USN).
+  - In practice access is enforced by SCOPING the data: a student only
+    gets their own record, a faculty only gets their own students,
+    admin gets everything (see data_retriever.py). The system prompt
+    also changes per role.
+HONEST NOTE: the hard gate check_permission() exists in rbac.py but is
+NOT actually called in the /ask flow — access is controlled by which
+data function runs, not by an explicit allow/deny check. So it is
+"role-based scoping" more than fully enforced RBAC.
+
+----------------------------------------------------------------
+9. What does "hybrid execution" and "secure queries" mean here?
+----------------------------------------------------------------
+HYBRID EXECUTION = mixing two answer strategies:
+  - Deterministic / rule-based: for known intents the answer is built
+    from a template with the real data — fast, cheap, always exact,
+    no LLM (Executor agent).
+  - LLM-based: for complex or unknown questions, the LLM writes the
+    answer (Composer / Knowledge agent).
+The system picks per question, so it is a hybrid of "code answers" and
+"AI answers". This is the strongest, most real claim in the resume.
+
+SECURE QUERIES = the intent is that a user can only reach data their
+role allows (a student can't read another student's marks). This is
+done via the role scoping above.
+HONEST NOTE: "secure" is the weakest word. /login accepts a password
+field but never checks it, and there is no auth token/session. So it
+is better described as "role-scoped" than "secure". Wiring
+check_permission() into /ask would make this claim genuinely true.
+
+----------------------------------------------------------------
+10. How does the conditional query routing work?
+----------------------------------------------------------------
+Every question is first CLASSIFIED as one of two types
+(classifier.py):
+  - "general_query"        -> conceptual / definition questions
+                              ("what is machine learning").
+  - "organizational_query" -> needs college data ("my attendance",
+                              "who is my mentor", "how many students").
+How it decides: keyword matching (a list of org terms like attendance,
+cgpa, mentor, backlog...), whether a real student/USN is mentioned,
+and a "definition shape" check ("what is..." with no personal word ->
+general). intent_agent.py + enrich_classification() then double-check
+against the CSV and upgrade weak guesses.
+
+Then agentic_workflow.py BRANCHES on that type:
+  - general_query        -> straight to the LLM (Knowledge agent).
+  - organizational_query -> into the data pipeline (router -> data
+                            agent -> executor/composer).
+That branch — "if general, ask the LLM; if organizational, fetch data"
+— is the conditional query routing.
+
+================================================================
+  QUICK RESUME HONESTY CHECKLIST
+================================================================
+STRONG / fully backed by code:
+  FastAPI, Groq + LLaMA 3.3, Docker, the agent pipeline + trace,
+  hybrid execution, and general-vs-organizational routing.
+FIX OR SOFTEN before an interview:
+  - n8n     : not in the repo at all -> add a real flow or remove it.
+  - Pandas  : only in legacy auth.py; live code uses stdlib csv.
+  - "secure"/RBAC : role scoping is real, but no password check and
+    check_permission() is never enforced -> say "role-scoped", or
+    wire check_permission() into /ask to make it literally true.
+
+================================================================
+  LIKELY INTERVIEW QUESTIONS + ANSWERS (based on the resume)
+================================================================
+Tip: for each answer, name a file. Interviewers trust "it's in
+agentic_workflow.py" far more than a vague description.
+
+----------------------------------------------------------------
+A. PROJECT OVERVIEW
+----------------------------------------------------------------
+Q1. Walk me through your project in 60 seconds.
+A.  It's a role-aware college knowledge assistant. A user logs in with
+    an ID, asks a question in plain English, and a FastAPI backend runs
+    it through a multi-agent pipeline: detect the role, classify the
+    question as general vs organizational, and either answer conceptual
+    questions with an LLM (LLaMA 3.3 on Groq) or fetch real student data
+    from a CSV and answer from it. Known data questions are answered
+    with deterministic templates (no LLM); complex ones fall back to the
+    LLM. It's containerized with Docker and deployed on Render.
+
+Q2. Why did you build it as a pipeline of agents instead of one big
+    LLM prompt?
+A.  Three reasons: (1) accuracy - for known questions I answer from
+    data with templates, so no hallucination and exact numbers;
+    (2) cost/latency - I skip the LLM entirely for simple questions;
+    (3) traceability - each stage records a trace step, so I can show
+    the user (and debug) exactly what happened. A single mega-prompt
+    gives none of those.
+
+Q3. What was the hardest part?
+A.  Getting query classification reliable with a small, offline
+    heuristic - deciding "is this about our data or a general concept?"
+    Edge cases like "what is my attendance" (personal -> data) vs
+    "what is attendance" (definition -> general). I solved it with a
+    two-pass approach: a keyword classifier, then a CSV-aware enrichment
+    pass that upgrades weak guesses (classifier.py + csv_db.py).
+
+----------------------------------------------------------------
+B. MULTI-AGENT / ORCHESTRATION
+----------------------------------------------------------------
+Q4. How do your agents communicate / pass data to each other?
+A.  They don't message each other directly. A single orchestrator,
+    run_agentic_workflow() in agentic_workflow.py, calls them in order
+    and threads each output into the next (role -> context -> intent ->
+    router -> data -> executor/composer). It's a sequential pipeline
+    with a shared trace list, not autonomous agents.
+
+Q5. Are these "real" AI agents?
+A.  Be honest: they're deterministic, single-purpose stages styled as
+    agents, plus two that call the LLM (composer/knowledge). I modeled
+    the flow as agents because each has one clear responsibility and
+    emits a trace, which made it modular and easy to extend - but only
+    2 of them actually invoke an LLM.
+
+Q6. Your resume says 5 agents - I count more/fewer. Explain.
+A.  The count depends on the path. A general question runs 4 stages; a
+    data question runs 6 (role, context, intent, router, data agent,
+    executor/composer). "5" is the typical middle. The core roles are
+    Role Guard, Context, Intent, Data Router/Agent, and Executor/
+    Composer. (Don't oversell the number - explain the pipeline.)
+
+Q7. How would you add a new capability, e.g. "fee status"?
+A.  Add the intent to the classifier keywords, add a retrieval branch
+    in data_retriever.py, register a data agent in data_agents.py, and
+    add a template case in _structured_answer(). No change to the
+    orchestrator - that's the point of the modular design.
+
+----------------------------------------------------------------
+C. RBAC / SECURITY  (expect probing here)
+----------------------------------------------------------------
+Q8. Explain your RBAC.
+A.  Four roles - admin, faculty, student, unknown - each with a
+    permission set in rbac.py. Role is detected from the ID pattern
+    (ADM*/FAC*/USN). Access is enforced by scoping the data: a student
+    sees only their own record, a faculty only their own students,
+    admin sees all (data_retriever.py).
+
+Q9. So can a student query another student's marks?
+A.  (Honest) In the current code, retrieval scopes to the requester, so
+    normally no - but I don't have a hard check_permission() gate on the
+    /ask path; enforcement is implicit via which data function runs. The
+    right fix is to call check_permission() (already defined in rbac.py)
+    at the start of /ask. I'd flag that as a known improvement.
+
+Q10. Is /login secure?
+A.  (Honest) No - it resolves a role from the ID but doesn't verify the
+    password, and there's no session/token. It's a demo auth. To
+    productionize I'd add hashed passwords, JWT sessions, and the
+    permission gate. I'd describe the current state as "role-scoped",
+    not "secured".
+
+Q11. How would you make it production-secure?
+A.  Hashed credentials, JWT/session auth, enforce check_permission() per
+    request, move data to a real DB with row-level access, input
+    validation (already have Pydantic), rate limiting, and audit logs.
+
+----------------------------------------------------------------
+D. HYBRID EXECUTION
+----------------------------------------------------------------
+Q12. What do you mean by "hybrid execution"?
+A.  The system chooses per question between a deterministic template
+    answer (no LLM) for known intents and an LLM-generated answer for
+    complex/unknown ones. See the executor vs composer branch in
+    agentic_workflow.py.
+
+Q13. How do you decide which path?
+A.  If the intent is in the known set (student_count, attendance_report,
+    mentor_lookup, etc.), use the template executor. Otherwise the
+    composer sends the retrieved data to the LLM to write the answer.
+
+Q14. What's the benefit / trade-off?
+A.  Benefit: known questions are fast, free, and exact - no
+    hallucination. Trade-off: templates are rigid, so anything outside
+    the known set needs the LLM. It's a deliberate accuracy-vs-
+    flexibility split.
+
+----------------------------------------------------------------
+E. CONDITIONAL QUERY ROUTING
+----------------------------------------------------------------
+Q15. How does routing decide general vs organizational?
+A.  classifier.py: keyword match against org terms (attendance, cgpa,
+    mentor, backlog...), whether a real student/USN is named, and a
+    "definition shape" check ("what is..." with no personal word ->
+    general). intent_agent.py then double-checks against the CSV.
+
+Q16. Give a case where it would misclassify, and how you'd fix it.
+A.  "Tell me about machine learning" contains no org term -> general,
+    correct. But "who teaches machine learning" - "teaches" maps to
+    faculty. If a phrase is ambiguous the heuristic can miss; I'd fix it
+    by replacing the keyword pass with an LLM classifier returning a
+    structured {query_type, intent, entity}, keeping the CSV enrichment
+    as a guardrail.
+
+Q17. Why heuristics instead of an LLM classifier?
+A.  Speed, zero cost, and no network call for the routing decision, plus
+    determinism for testing. The CSV enrichment pass covers many of the
+    heuristic's blind spots. An LLM classifier is the obvious upgrade.
+
+----------------------------------------------------------------
+F. GROQ / LLaMA / LLM
+----------------------------------------------------------------
+Q18. Why Groq and why LLaMA 3.3 70B specifically?
+A.  Groq gives very low-latency inference and a free tier; LLaMA 3.3 70B
+    is a strong open model good enough for Q&A and summarizing retrieved
+    data. Model id: llama-3.3-70b-versatile (agentic_workflow.py).
+
+Q19. How do you stop the LLM from hallucinating student data?
+A.  Two ways: known data questions never touch the LLM (templates), and
+    when the LLM is used I pass the retrieved CSV data in the prompt and
+    instruct it to answer only from that data (see the composer prompt).
+    It's grounding/retrieval, not free generation.
+
+Q20. What's temperature set to and why?
+A.  0.3 (main.py) - low, to keep answers factual and consistent rather
+    than creative, since it's an information assistant.
+
+Q21. How do you handle conversation memory?
+A.  main.py keeps a short in-memory history per user (last few turns,
+    MAX_HISTORY) and prepends it to each LLM call. Limitation: it's in
+    process memory, so it resets on restart and doesn't scale across
+    instances - I'd move it to Redis for production.
+
+----------------------------------------------------------------
+G. MCP / DATA
+----------------------------------------------------------------
+Q22. What is the MCP server in your project?
+A.  mcp_csv_server.py exposes the data functions (retrieve_data,
+    get_user_context) as named, schema-described tools - MCP (Model
+    Context Protocol) style. It decouples "what data can be fetched"
+    from the agents and is inspectable via /mcp/tools and /mcp/call.
+
+Q23. Where does the student data come from - is it real?
+A.  (Important, be honest) It's a CSV of students. Some fields are real
+    (name, USN, CGPA, email), but mentor, attendance %, backlogs, and
+    course lists are DERIVED by rules in csv_db.py (e.g. attendance is a
+    formula of CGPA/semester/id). I'd be upfront that those are
+    synthetic/derived, not measured.
+
+Q24. Why a CSV and not a database? How would you scale?
+A.  CSV was fastest for a college dataset of a few hundred rows, and I
+    cache it in memory. To scale I'd move to Postgres, index by USN,
+    and swap csv_db.py for a DB adapter - the retrieval layer is already
+    abstracted behind data_retriever.py / MCP tools, so the rest
+    wouldn't change.
+
+----------------------------------------------------------------
+H. FASTAPI / ENGINEERING
+----------------------------------------------------------------
+Q25. Why FastAPI? Did you use async?
+A.  FastAPI gives async support, automatic request validation via
+    Pydantic, and built-in docs. Yes - the LLM call is blocking, so I
+    run it in a thread with asyncio.to_thread (main.py) to avoid
+    blocking the event loop.
+
+Q26. How do you handle errors?
+A.  The /ask route maps exceptions to proper HTTP codes - 403 for
+    PermissionError, 400 for bad values, 500 for unexpected - and logs
+    the trace (main.py). Downloads clean up temp files via a background
+    task.
+
+Q27. How is it deployed?
+A.  Dockerized (python:3.11-slim, uvicorn) and deployed on Render via
+    render.yaml with a /health check and auto-deploy.
+
+----------------------------------------------------------------
+I. CURVEBALLS / HONESTY (prepare for these)
+----------------------------------------------------------------
+Q28. Show me the n8n workflow.
+A.  (Honest) n8n isn't wired into this repo - I listed it as part of the
+    intended automation stack but the working system doesn't use it. If
+    pressed, explain what you'd automate with it (e.g. nightly data
+    sync, alerting) or remove it from the resume. DO NOT bluff.
+
+Q29. Where do you use Pandas?
+A.  (Honest) It's a dependency and used in the legacy auth.py, but the
+    live CSV path uses Python's stdlib csv module for a small dataset.
+    I'd either say "in the earlier data-processing version" or migrate
+    csv_db.py to pandas to make it current.
+
+Q30. What would you improve if you had more time?
+A.  Enforce check_permission() on every request, real auth (JWT +
+    hashed passwords), an LLM-based classifier, a real database,
+    persistent conversation memory (Redis), and proper tests. Good
+    "self-aware engineer" answer - interviewers like this.
+
+
+
+
+user_id + query
+      │
+      ▼
+1. Role Guard ──► 2. Context ──► 3. Intent ──►  is it general?
+                                                 │            │
+                                            YES ─┘            └─ NO
+                                             ▼                   ▼
+                                    4. Knowledge Agent    5. Data Router
+                                       (LLM direct)             ▼
+                                                          6. Data Agent (specialist)
+                                                                ▼
+                                                    known intent? ─ YES ─► 7. Executor (templates, no LLM)
+                                                                └─ NO ──► 8. Composer (LLM + data)
+
+----------------------------------------------------------------
+  AGENT-BY-AGENT  (kya karta hai · kaise karta hai · example)
+----------------------------------------------------------------
+Example ke liye maan lo: user_id = "1NT23IS015" (Ahmed, ek student),
+query = "who is my mentor".
+
+1. ROLE GUARD agent
+   Kya: user ka role nikalta hai -> student / faculty / admin / unknown.
+   Kaise: ID ka PATTERN dekhta hai. "ADM.." -> admin, "FAC.." -> faculty,
+          warna USN ko CSV me dhoondta hai (find_student). Koi LLM nahi,
+          sirf matching.  [rbac.py -> resolve_identity]
+   Example: "FAC001" -> faculty | "1NT23IS015" -> student (CSV me mil gaya)
+            | "XYZ999" -> unknown.
+
+2. CONTEXT agent
+   Kya: jo role mila uska background/profile CSV se load karta hai.
+   Kaise: role ke hisaab se branch. Student -> uski poori row (CGPA,
+          semester, courses). Faculty -> uske students + averages.
+          [csv_db.py -> default_context]
+   Example: role=student -> Ahmed ka profile { name, CGPA 8.5, sem 6,
+            department ISE } load ho gaya.
+
+3. INTENT agent
+   Kya: sabse pehle query ko 2 type me daalta hai -> "organizational"
+        (data chahiye) ya "general" (concept). Phir asli intent nikalta
+        hai (mentor / attendance / profile / count...).
+   Kaise: keyword matching (mentor, attendance, cgpa, backlog jaise words)
+          + "what is/define" wali line ko general maan leta hai. Uske baad
+          CSV se check karke weak guess ko upgrade karta hai.
+          [classifier.py + csv_db.py -> enrich_classification]
+   Example: "who is my mentor" -> word "mentor" mila -> intent =
+            mentor_lookup, type = organizational, entity = 1NT23IS015.
+   Example: "explain neural networks" -> koi org word nahi -> general.
+
+4. KNOWLEDGE agent  (sirf general query ke liye)
+   Kya: concept wale sawaal ka jawab deta hai, koi data lookup nahi.
+   Kaise: query seedha Groq/LLaMA ko bhej deta hai aur jawab return.
+          [agentic_workflow.py -> ask_groq]
+   Example: "explain neural networks" -> LLM ka paragraph answer.
+   (Agar query organizational hai to yeh skip, aur 5-8 chalta hai.)
+
+5. DATA ROUTER agent
+   Kya: intent pata hai to decide karta hai kaunsa data agent chalega.
+   Kaise: ek dictionary/map dekhta hai (intent -> function). No LLM.
+          [data_agents.py -> route_data_agent, AGENTS map]
+   Example: intent = mentor_lookup -> _mentor_agent choose kiya.
+
+6. DATA agent  (specialist)
+   Kya: uss intent ke liye asli data CSV se nikalta hai.
+   Kaise: ek shared tool call_tool("retrieve_data") ko call karta hai jo
+          intent ke hisaab se summary banata hai. NOTE: mentor/attendance/
+          backlog CSV me stored nahi hai -> rules se DERIVE hote hai.
+          Role scoping bhi yahin -> faculty ko sirf apne students milte hai.
+          [data_agents.py -> mcp_csv_server.py -> data_retriever.py]
+   Example: mentor_summary(Ahmed) -> { mentor: { name "Dr. Asha Rao",
+            email, phone } }.
+
+7. EXECUTOR agent  (known intents -> NO LLM)
+   Kya: jaana-pehchana intent ho to fixed template me data bhar ke jawab
+        banata hai. Fast, sasta, exact, hallucination nahi.
+   Kaise: bade if/elif me har intent ka ek ready sentence template hota
+          hai, usme values daal deta hai.  [agentic_workflow.py ->
+          _structured_answer]
+   Example: "The mentor for Ahmed Syed Mohammad is Dr. Asha Rao.
+            Email: asha.rao@nmit.ac.in, phone: 9000001001."
+
+8. COMPOSER agent  (complex/unknown intent -> LLM use)
+   Kya: jis intent ka template nahi hai, uska natural-language jawab LLM
+        se likhwata hai.
+   Kaise: nikala hua data prompt me daal ke Groq/LLaMA ko bhejta hai aur
+          bolta hai "sirf isi data se answer do" (taaki galat na bane).
+          [agentic_workflow.py -> composer branch]
+   Example: koi mixed/ajeeb sawaal -> data ke saath LLM ka clean paragraph.
+
+Ek line me flow (mentor wala example):
+  Role Guard(student) -> Context(Ahmed profile) -> Intent(mentor_lookup)
+  -> Router(_mentor_agent) -> Data(Dr. Asha Rao) -> Executor(template answer)
+  -> Composer SKIP. Total LLM calls = 0.
+
+Yaad rakho: yeh "agents" mostly fixed code steps hai (pattern match,
+dictionary, template). Sirf agent 4 (Knowledge) aur 8 (Composer) actually
+LLM ko call karte hai — baaki sab deterministic hai.
+Composer Agent -> LLM se answer providing context
