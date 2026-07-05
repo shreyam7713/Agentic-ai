@@ -22,26 +22,5 @@
         "get_backlogs"
       ]
     }
-  ],
-  "1NT23IS015": [
-    {
-      "ts": "2026-07-05T17:08:10+00:00",
-      "role": "student",
-      "query": "What is my attendance?",
-      "answer": "Your attendance is 94.0%.",
-      "tool_calls": [
-        "get_attendance"
-      ]
-    },
-    {
-      "ts": "2026-07-05T17:15:41+00:00",
-      "role": "student",
-      "query": "am i above average in class",
-      "answer": "Based on the available data, your current CGPA is 8.5, and the class average grade is 7.81. Since your CGPA (8.5) is higher than the class average (7.81), you are above average in your class.",
-      "tool_calls": [
-        "get_grades",
-        "get_class_average"
-      ]
-    }
   ]
 }

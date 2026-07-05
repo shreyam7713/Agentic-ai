@@ -156,8 +156,13 @@ def _structured_answer(query: str, role: str, payload: Dict[str, Any]) -> str:
         )
 
     if intent == "student_profile":
-        if summary.get("faculty_id") is not None:
-            courses = ", ".join(summary.get("courses", [])[:5])
+        # Faculty profile — detect by a faculty-ONLY field. A student row also
+        # carries `faculty_id` (their assigned faculty), so that can't be the test.
+        if summary.get("mentee_count") is not None or summary.get("student_count") is not None:
+            courses = ", ".join(
+                c if isinstance(c, str) else c.get("fullname", "")
+                for c in summary.get("courses", [])[:5]
+            )
             return (
                 f"{summary.get('name')} ({summary.get('faculty_id')}) — {summary.get('department', 'N/A')} faculty.\n"
                 f"Students: {summary.get('student_count', 0)}; mentees: {summary.get('mentee_count', 0)}.\n"
