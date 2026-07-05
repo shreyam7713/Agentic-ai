@@ -1,7 +1,7 @@
 """
 main.py — Moodle AI Assistant Backend (CSV Edition)
 ===================================================
-Uses students_500.csv as the only student database.
+Uses students.csv as the only student database.
 Conversation memory and multi-format export are preserved.
 """
 
@@ -23,12 +23,16 @@ from groq import Groq
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
+import auth_store
+import memory_store
 from agent_loop import run_agent
 from agentic_workflow import run_agentic_workflow
 from classifier import classify_query
 from csv_db import student_count
 from data_retriever import assign_mentor, get_user_context, retrieve_data
+from mcp_client import call_tool_via_mcp, list_tools_via_mcp
 from mcp_csv_server import call_tool, list_tools
+from multi_agent import run_multi_agent
 from rbac import resolve_identity
 from response_formatter import (
     create_excel,
@@ -213,7 +217,7 @@ def _build_download_response(file_path: Path, media_type: str, filename: str) ->
 def _build_system_prompt(role: str) -> str:
     base = (
         "You are Moodle AI, the academic assistant for NMIT (Nitte Meenakshi Institute of Technology). "
-        "You have access to real student data from students_500.csv. "
+        "You have access to real student data from students.csv. "
         "Always answer using the data provided in the user message — never say 'navigate to Moodle'. "
         "Keep responses clear, specific, and professional. "
         "You remember the full conversation history and can refer back to earlier messages.\n\n"
@@ -224,7 +228,7 @@ def _build_system_prompt(role: str) -> str:
             "The user is a STUDENT. Rules:\n"
             "- You MUST answer questions about their own data — grades, attendance, "
             "enrolled courses, profile. This is always allowed.\n"
-            "- The data payload contains this student's own records from students_500.csv.\n"
+            "- The data payload contains this student's own records from students.csv.\n"
             "- If asked about their grades, attendance, or profile, present the data clearly.\n"
             "- Only refuse if they explicitly ask about a DIFFERENT student.\n"
             "- Be friendly and personal — use their name.\n"
@@ -257,7 +261,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "version": "4.0.0-csv",
-        "database": "students_500.csv",
+        "database": "students.csv",
         "students": student_count(),
     }
 
@@ -267,6 +271,9 @@ async def login(payload: LoginRequest):
     identity = resolve_identity(payload.user_id)
     if identity.role == "unknown":
         raise HTTPException(status_code=401, detail="Invalid user ID")
+    # Real credential check — the password is now verified, not ignored.
+    if not auth_store.verify(payload.user_id, payload.password):
+        raise HTTPException(status_code=401, detail="Invalid password")
     context = get_user_context(
         user_id=payload.user_id,
         role=identity.role,
@@ -317,6 +324,7 @@ async def home():
 @app.post("/chat/clear")
 async def clear_history(payload: ClearHistoryRequest):
     _chat_history.pop(payload.user_id, None)
+    memory_store.clear(payload.user_id)       # also wipe persistent episodic memory
     return JSONResponse({"message": f"History cleared for {payload.user_id}"})
 
 
@@ -349,12 +357,16 @@ async def ask_agentic(payload: AskAgenticRequest):
     """
     try:
         client = _get_client()
+        history = memory_store.history_messages(payload.user_id, limit=3)
         result = await asyncio.to_thread(
             run_agent,
             client=client,
             user_id=payload.user_id,
             query=payload.query,
+            history=history,
         )
+        memory_store.record_turn(payload.user_id, result["role"], payload.query,
+                                 result["answer"], result["tool_calls"])
         logger.info("Agentic user=%s role=%s tools=%s",
                     payload.user_id, result["role"], result["tool_calls"])
         return JSONResponse(json.loads(_json_dumps({
@@ -368,6 +380,67 @@ async def ask_agentic(payload: AskAgenticRequest):
     except Exception as exc:
         logger.exception("Unhandled error in /ask/agentic")
         raise HTTPException(status_code=500, detail=f"Server error: {exc}")
+
+
+@app.post("/ask/multiagent")
+async def ask_multiagent(payload: AskAgenticRequest):
+    """
+    Multi-agent endpoint (Level 3-5): a Planner decomposes the query, an
+    RBAC-Guard validates each subtask, Data/Analytics workers with restricted
+    toolsets gather facts on a shared blackboard, a Synthesizer composes the
+    answer, a reflection critic checks it against the data, and an output
+    guardrail redacts any leaked PII. The full agent trace is returned.
+    """
+    try:
+        client = _get_client()
+        result = await asyncio.to_thread(
+            run_multi_agent,
+            client=client,
+            user_id=payload.user_id,
+            query=payload.query,
+        )
+        memory_store.record_turn(payload.user_id, result["role"], payload.query,
+                                 result["answer"], result["tool_calls"])
+        logger.info("MultiAgent user=%s role=%s plan=%d tools=%s",
+                    payload.user_id, result["role"], len(result["plan"]),
+                    result["tool_calls"])
+        return JSONResponse(json.loads(_json_dumps({
+            "answer": format_text_response(result["answer"]),
+            "role": result["role"],
+            "plan": result["plan"],
+            "tool_calls": result["tool_calls"],
+            "reflection": result["reflection"],
+            "guardrail": result["guardrail"],
+            "trace": result["trace"],
+        })))
+    except RuntimeError as exc:            # missing GROQ_API_KEY
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unhandled error in /ask/multiagent")
+        raise HTTPException(status_code=500, detail=f"Server error: {exc}")
+
+
+@app.get("/memory/{user_id}")
+async def get_memory(user_id: str):
+    """Inspect a user's persistent episodic memory (Level 5)."""
+    return JSONResponse(json.loads(_json_dumps({
+        "user_id": user_id,
+        "turns": memory_store.get_all(user_id),
+    })))
+
+
+@app.get("/mcp/v2/tools")
+async def mcp_v2_tools():
+    """Discover tools over the REAL MCP stdio server (Level 4)."""
+    return JSONResponse(await asyncio.to_thread(list_tools_via_mcp))
+
+
+@app.post("/mcp/v2/call")
+async def mcp_v2_call(payload: McpCallRequest):
+    """Call a tool over the REAL MCP stdio server (Level 4). RBAC still applies."""
+    return JSONResponse(json.loads(_json_dumps(
+        await asyncio.to_thread(call_tool_via_mcp, payload.name, payload.arguments)
+    )))
 
 
 @app.post("/ask")

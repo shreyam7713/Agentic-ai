@@ -1,7 +1,35 @@
 # Implementing Agentic AI in the Moodle AI Assistant
 
-A design document for turning the current **deterministic pipeline** into a
+A design document for turning the original **deterministic pipeline** into a
 genuinely **agentic** system.
+
+---
+
+## ✅ Implementation status (as built)
+
+All five levels below are now implemented and verified end-to-end against
+`data/students.csv` (194 real student records) using Groq
+`llama-3.3-70b-versatile`.
+
+| Level | Capability | Status | Where |
+|---|---|---|---|
+| 1 | LLM tool-calling agent loop | ✅ Done | [`agent_loop.py`](agent_loop.py), endpoint `POST /ask/agentic` |
+| 2 | Multiple real, single-purpose tools (11) with per-tool RBAC | ✅ Done | [`agent_tools.py`](agent_tools.py) |
+| 3 | Planner + RBAC-guard + Data/Analytics workers + Synthesizer over a shared blackboard | ✅ Done | [`multi_agent.py`](multi_agent.py), endpoint `POST /ask/multiagent` |
+| 4 | Real MCP server over **stdio** + MCP client bridge | ✅ Done | [`mcp_stdio_server.py`](mcp_stdio_server.py), [`mcp_client.py`](mcp_client.py), endpoints `/mcp/v2/tools`, `/mcp/v2/call` |
+| 5 | Queryable episodic **memory**, **reflection** critic, output **guardrail** | ✅ Done | [`memory_store.py`](memory_store.py), [`reflection.py`](reflection.py), [`guardrails.py`](guardrails.py) |
+
+**Runtime blockers fixed along the way:**
+- CSV path was hardcoded to a missing absolute path → now repo-relative
+  (`csv_db.DEFAULT_CSV_PATH = BASE_DIR/"data"/"students.csv"`, env-overridable).
+- The loader read columns (`usn`, `id`) that don't exist in the shipped CSV, and
+  *derived* attendance/mentor/backlogs → now maps the real columns
+  (`student_id`, `attendance_percent`, `mentor_*`, `backlog_*`, …).
+- `/login` ignored the password (any value logged in as anyone) → now verified
+  against a salted-hash store ([`auth_store.py`](auth_store.py)).
+
+The rest of this document is the original design write-up; each level's sketch
+below is realized by the files named above.
 
 ---
 
@@ -306,5 +334,21 @@ valid in the agentic version:
 > communicate through a shared blackboard, with role-based access control
 > enforced at the agent level and a full execution trace for explainability.
 
-Every clause of that paragraph maps to a level above — so once you build them,
-it is all true.
+Every clause of that paragraph maps to a level above — and, as of this build,
+every clause is **implemented and verified**, not aspirational:
+
+- *"LLM reasoning loop selects and invokes tools via function-calling"* →
+  [`agent_loop.py`](agent_loop.py) (`tool_choice="auto"`, step budget, trace).
+- *"multi-hop retrieval"* → verified: a compound query chains `get_grades` +
+  `get_class_average` in one run.
+- *"Tools exposed through a Model Context Protocol server over stdio"* →
+  [`mcp_stdio_server.py`](mcp_stdio_server.py) via the official `mcp` SDK; the
+  app consumes them as a client in [`mcp_client.py`](mcp_client.py).
+- *"planner decomposes and delegates to specialised workers … shared
+  blackboard"* → [`multi_agent.py`](multi_agent.py) (`Blackboard`, planner,
+  RBAC-guard, Data/Analytics workers, synthesizer).
+- *"RBAC enforced at the agent level"* → the RBAC-guard drops out-of-scope
+  subtasks *and* [`agent_tools.authorize()`](agent_tools.py) gates every tool.
+- *"full execution trace for explainability"* → returned by every agentic
+  endpoint and rendered in the UI's 🧠 Agentic trace panel.
+- Plus Level 5: episodic memory, a reflection critic, and a PII-leak guardrail.

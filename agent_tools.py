@@ -14,7 +14,7 @@ lets through for the current user. Security is code, never the model's choice.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from csv_db import (
     attendance_summary,
@@ -107,7 +107,7 @@ def _h_contact(identity: RoleIdentity, eff: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _h_student_count(identity: RoleIdentity, eff: Dict[str, Any]) -> Dict[str, Any]:
-    return {"count": student_count(), "source": "students_500.csv"}
+    return {"count": student_count(), "source": "students.csv"}
 
 
 def _h_class_average(identity: RoleIdentity, eff: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,6 +140,15 @@ def _h_list_my_students(identity: RoleIdentity, eff: Dict[str, Any]) -> Dict[str
     else:  # admin
         cohort = load_students()
     return {"count": len(cohort), "students": [_brief(s) for s in cohort[:30]]}
+
+
+def _h_recall_memory(identity: RoleIdentity, eff: Dict[str, Any]) -> Dict[str, Any]:
+    """Query the CURRENT user's episodic memory — the agent's window into what
+    was discussed in earlier turns (Level 5)."""
+    from memory_store import recall
+    hits = recall(identity.user_id, eff.get("query", ""), k=3)
+    return {"recalled": [{"when": h["ts"], "you_asked": h["query"],
+                          "we_answered": h["answer"]} for h in hits]}
 
 
 # ── The registry ─────────────────────────────────────────────────────────────
@@ -190,17 +199,36 @@ TOOLS: List[Tool] = [
     Tool("list_my_students", "List the students a faculty mentors (or all "
          "students, for admin).", {"type": "object", "properties": {}},
          "directory", _h_list_my_students),
+
+    Tool("recall_memory", "Search this conversation's earlier turns to remember "
+         "what the user asked or was told before. Use when the user refers to "
+         "something 'earlier' or 'again'.",
+         {"type": "object", "properties": {
+             "query": {"type": "string", "description": "What to look for in past turns."}
+         }, "required": ["query"]}, "aggregate", _h_recall_memory),
 ]
 
 TOOLS_BY_NAME: Dict[str, Tool] = {t.name: t for t in TOOLS}
 
+# Tool groups used by the multi-agent orchestrator to give each worker a
+# restricted, purpose-built toolset (Level 3).
+INDIVIDUAL_TOOLS = [t.name for t in TOOLS if t.scope == "individual"]
+AGGREGATE_TOOLS = [t.name for t in TOOLS if t.scope == "aggregate"]
+DIRECTORY_TOOLS = [t.name for t in TOOLS if t.scope == "directory"]
 
-def groq_tool_specs() -> List[Dict[str, Any]]:
-    """Render the registry into the tool-calling schema Groq/OpenAI expects."""
+
+def groq_tool_specs(allowed: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
+    """Render the registry into the tool-calling schema Groq/OpenAI expects.
+
+    Pass `allowed` (a set/list of tool names) to expose only a subset — this is
+    how each worker agent gets a restricted capability surface.
+    """
+    names = set(allowed) if allowed is not None else None
     return [
         {"type": "function", "function": {
             "name": t.name, "description": t.description, "parameters": t.parameters}}
         for t in TOOLS
+        if names is None or t.name in names
     ]
 
 

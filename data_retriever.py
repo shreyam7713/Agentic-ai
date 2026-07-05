@@ -2,7 +2,7 @@
 data_retriever.py
 
 CSV-only data retrieval layer.
-All student data comes from /Users/palakpandit/Desktop/students_500.csv.
+All student data comes from data/students.csv (see csv_db.CSV_PATH).
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ def _target_student(entity: str, user_id: str) -> Dict[str, Any] | None:
 def _student_count() -> Dict[str, Any]:
     return {
         "count": student_count(),
-        "course": "students_500.csv",
-        "source": "students_500.csv",
+        "course": "students.csv",
+        "source": "students.csv",
     }
 
 
@@ -61,7 +61,7 @@ def _course_enrollment(entity: str, user_id: str, role: str) -> Dict[str, Any]:
             "student_name": student["name"],
             "count": student["course_count"],
             "enrolled_courses": student["enrolled_courses"],
-            "source": "students_500.csv",
+            "source": "students.csv",
         }
 
     if role == "faculty":
@@ -82,7 +82,7 @@ def _course_enrollment(entity: str, user_id: str, role: str) -> Dict[str, Any]:
                 }
                 for s in students[:50]
             ],
-            "source": "students_500.csv",
+            "source": "students.csv",
         }
 
     dept = (entity or "").strip().upper()
@@ -102,7 +102,7 @@ def _course_enrollment(entity: str, user_id: str, role: str) -> Dict[str, Any]:
         "course": dept if dept and dept != "GENERAL" else "all_students",
         "count": len(students),
         "students": students[:50],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -114,10 +114,10 @@ def _grades_average(entity: str, user_id: str) -> Dict[str, Any]:
     students = load_students()
     avg = round(sum(s["cgpa"] for s in students) / len(students), 2) if students else 0
     return {
-        "course": "students_500.csv",
+        "course": "students.csv",
         "average_grade": avg,
         "grade_count": len(students),
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -128,7 +128,7 @@ def _faculty_average(user_id: str) -> Dict[str, Any]:
         "course": "my_students",
         "average_grade": avg,
         "grade_count": len(students),
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -140,7 +140,7 @@ def _faculty_attendance(user_id: str) -> Dict[str, Any]:
         "average_attendance_percent": avg,
         "student_count": len(students),
         "students": students[:12],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -158,7 +158,7 @@ def _faculty_backlogs(user_id: str) -> Dict[str, Any]:
     return {
         "count_with_backlogs": len(students),
         "students": students[:30],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -176,7 +176,7 @@ def _faculty_list(entity: str) -> Dict[str, Any]:
         "faculty": [m["name"] for m in mentors],
         "faculty_details": mentors,
         "count": len(mentors),
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -186,7 +186,7 @@ def _course_catalog() -> Dict[str, Any]:
         "course": "all_courses",
         "count": len(courses),
         "enrolled_courses": courses,
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -249,7 +249,7 @@ def retrieve_data(
     else:
         result["summary"] = {
             "message": "CSV database is connected, but no specialized intent was triggered.",
-            "source": "students_500.csv",
+            "source": "students.csv",
         }
 
     return _clean(result)
@@ -266,12 +266,12 @@ def assign_mentor(
     mentor_phone: str = "",
 ) -> Dict[str, Any]:
     """
-    CSV-only mode does not mutate students_500.csv. This endpoint validates
+    CSV-only mode does not mutate students.csv. This endpoint validates
     the student and returns the requested mentor assignment for UI feedback.
     """
     student = find_student(student_id)
     if not student:
-        raise ValueError(f"Student '{student_id}' was not found in students_500.csv.")
+        raise ValueError(f"Student '{student_id}' was not found in students.csv.")
 
     assignment = {
         "mentor_name": mentor_name.strip(),

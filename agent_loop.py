@@ -60,25 +60,42 @@ def run_agent(
     model: str = "llama-3.3-70b-versatile",
     max_steps: int = 6,
     history: List[Dict[str, str]] | None = None,
+    identity: RoleIdentity | None = None,
+    allowed_tools: List[str] | None = None,
+    system_prompt: str | None = None,
+    agent_name: str = "reasoner",
 ) -> Dict[str, Any]:
     """
     Run the tool-calling agent loop for one query.
 
     `client` is a Groq client (chat.completions.create with tool support).
-    Returns {answer, role, trace, tool_calls} where trace records every
-    decision the loop made — the explainability layer.
+    Returns {answer, role, trace, tool_calls, observations} where trace records
+    every decision the loop made — the explainability layer.
+
+    Optional args let the multi-agent orchestrator (Level 3) reuse this loop:
+      - `identity`       pre-resolved identity (skip re-resolution)
+      - `allowed_tools`  restrict the loop to a subset of tool names
+      - `system_prompt`  override the default single-agent prompt
+      - `agent_name`     label used in the trace for this agent
     """
-    identity = resolve_identity(user_id)
+    if identity is None:
+        identity = resolve_identity(user_id)
     trace: List[Dict[str, str]] = [
         _step("rbac-guard", "resolve_identity", "completed",
               f"Resolved role='{identity.role}' for id='{identity.user_id}'.")
     ]
 
-    tools = groq_tool_specs()
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt(identity)}]
+    tools = groq_tool_specs(allowed_tools)
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt or _system_prompt(identity)}
+    ]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": query})
+
+    # Every tool observation, kept so callers (synthesizer, critic, guardrail)
+    # can ground the final answer in exactly what the tools returned.
+    observations: List[Dict[str, Any]] = []
 
     tool_calls_made: List[str] = []
 
@@ -95,10 +112,11 @@ def run_agent(
 
         # No tool call → the model is done reasoning.
         if not calls:
-            trace.append(_step("reasoner", "final_answer", "completed",
+            trace.append(_step(agent_name, "final_answer", "completed",
                                f"Answered after {len(tool_calls_made)} tool call(s)."))
             return {"answer": (msg.content or "").strip(), "role": identity.role,
-                    "trace": trace, "tool_calls": tool_calls_made}
+                    "trace": trace, "tool_calls": tool_calls_made,
+                    "observations": observations}
 
         # Record the model's decision, then execute each requested tool.
         messages.append({"role": "assistant", "content": msg.content or "",
@@ -114,6 +132,7 @@ def run_agent(
             result = execute_tool(identity, name, args)          # ← RBAC gate inside
             denied = result.get("error") == "ACCESS_DENIED"
             tool_calls_made.append(name)
+            observations.append({"tool": name, "args": args, "result": result})
             trace.append(_step(
                 f"tool:{name}", name,
                 "denied" if denied else "completed",
@@ -133,4 +152,5 @@ def run_agent(
     final = client.chat.completions.create(
         model=model, messages=messages, temperature=0.2)
     return {"answer": (final.choices[0].message.content or "").strip(),
-            "role": identity.role, "trace": trace, "tool_calls": tool_calls_made}
+            "role": identity.role, "trace": trace, "tool_calls": tool_calls_made,
+            "observations": observations}

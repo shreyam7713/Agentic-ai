@@ -2,8 +2,9 @@
 csv_db.py
 
 CSV-only data adapter for the Moodle AI Assistant.
-The app treats students_500.csv as the single source of truth and derives
-mentor, attendance, and backlog fields for every student.
+The app treats data/students.csv as the single source of truth and reads
+mentor, class-teacher, attendance, backlog, and contact fields directly
+from each row (no more synthetic derivation).
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ from typing import Any, Dict, List, Optional
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CSV_PATH = Path("/Users/palakpandit/Desktop/students_500.csv")
-CSV_PATH = Path(os.getenv("STUDENT_DB_CSV_PATH", DEFAULT_CSV_PATH))
+# Repo-relative default so the app works on any machine; override with the env var.
+DEFAULT_CSV_PATH = BASE_DIR / "data" / "students.csv"
+CSV_PATH = Path(os.getenv("STUDENT_DB_CSV_PATH", str(DEFAULT_CSV_PATH)))
 USN_RE = re.compile(r"\b[0-9][a-z]{2}[0-9]{2}[a-z]{2}[0-9]{3}\b", re.IGNORECASE)
 
 MENTORS = [
@@ -130,6 +132,24 @@ def _normalise_name(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
 
+_EMPTY_TOKENS = {"", "0", "-", "nil", "none", "na", "n/a", "null"}
+
+
+def _split_subjects(value: Any) -> List[str]:
+    """Parse the CSV `backlog_subjects` cell (e.g. '0', 'DBMS, OS') into a list."""
+    text = str(value or "").strip()
+    if text.lower() in _EMPTY_TOKENS:
+        return []
+    parts = re.split(r"[;,/|]", text)
+    return [p.strip() for p in parts if p.strip() and p.strip().lower() not in _EMPTY_TOKENS]
+
+
+def _student_seed(usn: str) -> int:
+    """Stable integer id for a student, from the trailing digits of the USN."""
+    match = re.search(r"(\d+)$", usn or "")
+    return int(match.group(1)) if match else (abs(hash(usn)) % 100000)
+
+
 def _signature() -> tuple[str, float]:
     if not CSV_PATH.exists():
         return (str(CSV_PATH), 0)
@@ -178,30 +198,47 @@ def all_courses() -> List[Dict[str, Any]]:
     return courses
 
 
-def faculty_for_user(user_id: str) -> Optional[Dict[str, str]]:
-    raw = (user_id or "").strip().upper()
-    if not raw.startswith("FAC"):
-        return None
-    match = re.search(r"\d+", raw)
-    number = int(match.group(0)) if match else 1
-    mentor = MENTORS[(number - 1) % len(MENTORS)]
+def _faculty_ids(student: Dict[str, Any]) -> set[str]:
+    """Every faculty id a student is linked to (mentor, class teacher, dept faculty)."""
     return {
-        "faculty_id": raw,
-        "name": mentor["name"],
-        "email": mentor["email"],
-        "phone": mentor["phone"],
-        "department": "ISE",
-    }
+        student.get("mentor", {}).get("id", ""),
+        student.get("class_teacher", {}).get("id", ""),
+        student.get("faculty_id", ""),
+    } - {""}
+
+
+def faculty_for_user(user_id: str) -> Optional[Dict[str, str]]:
+    """Resolve a faculty profile from the real ids in the CSV (mentor / class
+    teacher / department faculty), not a synthetic lookup."""
+    fid = _normalise_usn(user_id)
+    if not fid.startswith("FAC"):
+        return None
+
+    for student in load_students():
+        mentor = student.get("mentor", {})
+        teacher = student.get("class_teacher", {})
+        if mentor.get("id") == fid and mentor.get("name"):
+            return {"faculty_id": fid, "name": mentor["name"], "email": mentor["email"],
+                    "phone": mentor["phone"], "department": student["department"],
+                    "role_type": "mentor"}
+        if teacher.get("id") == fid and teacher.get("name"):
+            return {"faculty_id": fid, "name": teacher["name"], "email": teacher["email"],
+                    "phone": teacher["phone"], "department": student["department"],
+                    "role_type": "class_teacher"}
+        if student.get("faculty_id") == fid and student.get("faculty_name"):
+            return {"faculty_id": fid, "name": student["faculty_name"], "email": "",
+                    "phone": "", "department": student["department"], "role_type": "faculty"}
+
+    # Unknown faculty id — allow login but with an empty roster.
+    return {"faculty_id": fid, "name": fid, "email": "", "phone": "",
+            "department": "ISE", "role_type": "faculty"}
 
 
 def students_for_faculty(user_id: str) -> List[Dict[str, Any]]:
-    faculty = faculty_for_user(user_id)
-    if not faculty:
+    fid = _normalise_usn(user_id)
+    if not fid:
         return []
-    return [
-        student for student in load_students()
-        if student["mentor"]["email"] == faculty["email"]
-    ]
+    return [s for s in load_students() if fid in _faculty_ids(s)]
 
 
 def faculty_profile(user_id: str) -> Optional[Dict[str, Any]]:
@@ -237,36 +274,69 @@ def faculty_profile(user_id: str) -> Optional[Dict[str, Any]]:
         "avg_attendance": avg_attendance,
         "avg_cgpa": avg_cgpa,
         "backlog_students": backlog_students,
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
     return profile
 
 
 def _clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    student_id = _to_int(row.get("id"))
+    usn = _normalise_usn(row.get("student_id") or row.get("usn"))
+    seed = _student_seed(usn)
     semester = _to_int(row.get("semester"))
     cgpa = _to_float(row.get("cgpa"))
-    backlog_count, backlog_courses = _derive_backlogs(cgpa)
-    mentor = _mentor_for(student_id, semester)
-    courses = _courses_for(str(row.get("department") or "ISE").strip(), semester)
-    attendance_percent = _derive_attendance(student_id, cgpa, semester)
+    department = str(row.get("department") or "").strip() or "Information Science and Engineering"
+
+    # Real values straight from the CSV — no derivation.
+    attendance_percent = _to_float(row.get("attendance_percent"))
+    backlog_count = _to_int(row.get("backlog_count"))
+    backlog_courses = _split_subjects(row.get("backlog_subjects"))
+
+    college_email = str(row.get("college_email") or "").strip()
+    personal_email = str(row.get("personal_email") or "").strip()
+    email = college_email or personal_email
+
+    mentor = {
+        "id": _normalise_usn(row.get("mentor_id")),
+        "name": str(row.get("mentor_name") or "").strip(),
+        "email": str(row.get("mentor_email") or "").strip(),
+        "phone": str(row.get("mentor_phone") or "").strip(),
+    }
+    if not mentor["name"]:  # fallback only if the row has no mentor
+        mentor = {"id": "", **_mentor_for(seed, semester)}
+
+    class_teacher = {
+        "id": _normalise_usn(row.get("class_teacher_id")),
+        "name": str(row.get("class_teacher_name") or "").strip(),
+        "email": str(row.get("class_teacher_email") or "").strip(),
+        "phone": str(row.get("class_teacher_phone") or "").strip(),
+    }
+
+    courses = _courses_for(department, semester)
     total_sessions = 80
     present = round(total_sessions * attendance_percent / 100)
     absent = total_sessions - present
 
     return {
-        "id": student_id,
-        "student_id": _normalise_usn(row.get("usn")),
-        "usn": _normalise_usn(row.get("usn")),
-        "username": _normalise_usn(row.get("usn")),
+        "id": seed,
+        "student_id": usn,
+        "usn": usn,
+        "username": usn,
         "name": str(row.get("name") or "").strip(),
+        "gender": str(row.get("gender") or "").strip(),
+        "dob": str(row.get("dob") or "").strip(),
         "semester": semester,
+        "section": str(row.get("section") or "").strip(),
         "cgpa": cgpa,
-        "email": str(row.get("email") or "").strip(),
+        "grade": str(row.get("grade") or "").strip(),
+        "aggregate_percent": _to_float(row.get("aggregate_percent")),
+        "email": email,
+        "college_email": college_email,
+        "personal_email": personal_email,
         "phone": str(row.get("phone") or "").strip(),
-        "batch": str(row.get("batch") or "").strip(),
-        "department": str(row.get("department") or "").strip(),
-        "course": str(row.get("department") or "ISE").strip(),
+        "batch": "",
+        "department": department,
+        "course": str(row.get("course") or "").strip(),
+        "area_of_interest": str(row.get("area_of_interest") or "").strip(),
         "courses": courses,
         "enrolled_courses": courses,
         "course_count": len(courses),
@@ -278,9 +348,14 @@ def _clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "excused": 0,
         "backlog_count": backlog_count,
         "backlog_courses": backlog_courses,
-        "mentor": dict(mentor),
-        "class_teacher": dict(mentor),
-        "source": "students_500.csv",
+        "faculty_id": _normalise_usn(row.get("faculty_id")),
+        "faculty_name": str(row.get("faculty") or "").strip(),
+        "mentor": mentor,
+        "class_teacher": class_teacher,
+        "x_percent": _to_float(row.get("x_percent")),
+        "xii_percent": _to_float(row.get("xii_percent")),
+        "year_gaps": _to_int(row.get("year_gaps")),
+        "source": "students.csv",
     }
 
 
@@ -431,7 +506,7 @@ def user_context_for_student(student: Dict[str, Any]) -> Dict[str, Any]:
             "can_assign_mentor": False,
             "can_view_all_students": False,
         },
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -454,7 +529,7 @@ def default_context(user_id: str = "", role: str = "student") -> Dict[str, Any]:
                 "can_view_all_students": True,
             },
             "mentor_directory": MENTORS,
-            "source": "students_500.csv",
+            "source": "students.csv",
         }
     return {
         "role": role,
@@ -468,7 +543,7 @@ def default_context(user_id: str = "", role: str = "student") -> Dict[str, Any]:
             "can_assign_mentor": role in {"faculty", "admin"},
             "can_view_all_students": role in {"faculty", "admin"},
         },
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -484,7 +559,7 @@ def contact_summary(student: Dict[str, Any]) -> Dict[str, Any]:
             "email": student["email"],
             "phone": student["phone"],
         },
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -493,7 +568,7 @@ def mentor_summary(student: Dict[str, Any]) -> Dict[str, Any]:
         "student_id": student["usn"],
         "name": student["name"],
         "mentor": student["mentor"],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -509,7 +584,7 @@ def attendance_summary(student: Dict[str, Any]) -> Dict[str, Any]:
         "late": student["late"],
         "excused": student["excused"],
         "student_count": 1,
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -522,7 +597,7 @@ def backlog_summary(student: Dict[str, Any]) -> Dict[str, Any]:
             "backlog_count": student["backlog_count"],
             "backlog_courses": student["backlog_courses"],
         }] if student["backlog_count"] else [],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }
 
 
@@ -540,5 +615,5 @@ def all_backlogs(limit: int = 30) -> Dict[str, Any]:
     return {
         "count_with_backlogs": len(students),
         "students": students[:limit],
-        "source": "students_500.csv",
+        "source": "students.csv",
     }

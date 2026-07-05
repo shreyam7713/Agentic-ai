@@ -747,6 +747,10 @@ a{color:inherit;text-decoration:none}
               <option value="excel">📊 Excel</option>
               <option value="word">📝 Word</option>
             </select>
+            <label class="fmt-select" style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Planner → workers → synthesizer, with an on-screen agent trace">
+              <input type="checkbox" id="agenticToggle" checked style="margin:0;cursor:pointer">
+              🧠 Agentic
+            </label>
           </div>
           <div style="display:flex;align-items:center;gap:8px">
             <div id="loadingIndicator" style="display:none;align-items:center;gap:7px;font-size:12px;color:var(--text-3)">
@@ -1074,8 +1078,14 @@ function renderProfile(profile) {
   const p = k => esc(profile[k] ?? '—');
 
   // ── Faculty / Admin profile card ──────────────────────────────────────────
-  if (profile.faculty_id !== undefined) {
-    const courses  = Array.isArray(profile.courses)  ? profile.courses.join(', ')  : '—';
+  // Detect faculty by a faculty-ONLY field. (A student row also carries a
+  // `faculty_id` — their assigned faculty — so that can't be the discriminator.)
+  if (profile.mentee_count !== undefined || profile.student_count !== undefined) {
+    // `courses` may be strings (faculty) or course objects (defensive) — map to names.
+    const courseNames = (Array.isArray(profile.courses) ? profile.courses : [])
+      .map(c => (typeof c === 'string' ? c : (c.fullname || c.shortname || c.name || '')))
+      .filter(Boolean);
+    const courses  = courseNames.length ? courseNames.join(', ') : '—';
     const sections = Array.isArray(profile.sections) ? profile.sections.join(', ') : '—';
     const ctSecs   = Array.isArray(profile.class_teacher_sections) && profile.class_teacher_sections.length
                      ? profile.class_teacher_sections.join(', ') : '—';
@@ -1227,10 +1237,35 @@ async function loadContext() {
   }
 }
 
+const agenticToggle = $('agenticToggle');
+
+const STATUS_ICON = { completed: '✓', denied: '⛔', revised: '✏️', error: '⚠️' };
+
+function renderTrace(plan, trace, reflection, guardrail) {
+  const steps = (trace || [])
+    .map(s => `<div style="display:flex;gap:8px;padding:2px 0">
+        <span style="width:14px;text-align:center">${STATUS_ICON[s.status] || '•'}</span>
+        <span style="color:var(--text-3);min-width:120px"><b>${s.agent}</b></span>
+        <span style="color:var(--text-2)">${s.detail || s.action}</span></div>`)
+    .join('');
+  const planLine = (plan && plan.length)
+    ? `<div style="margin-bottom:6px;color:var(--text-2)"><b>Plan:</b> ${plan.map(p => `[${p.agent}] ${p.task}`).join('  •  ')}</div>`
+    : '';
+  const checks = [];
+  if (reflection) checks.push(`reflection: ${reflection.supported ? 'supported ✓' : 'corrected ✏️'}`);
+  if (guardrail)  checks.push(`guardrail: ${guardrail.safe ? 'clean ✓' : 'redacted ⛔'}`);
+  const checkLine = checks.length ? `<div style="margin-top:6px;color:var(--text-3)">${checks.join('  ·  ')}</div>` : '';
+  const html = `<details style="margin-top:8px;font-size:12px;background:var(--bg-2,rgba(127,127,127,.08));border-radius:8px;padding:8px 10px">
+      <summary style="cursor:pointer;color:var(--text-2)">🧠 Agent trace (${(trace || []).length} steps)</summary>
+      <div style="margin-top:8px">${planLine}${steps}${checkLine}</div></details>`;
+  appendMsg(html, 'ai', true);
+}
+
 async function sendQuery() {
   const uid   = userId.value.trim();
   const query = queryInput.value.trim();
   const fmt   = formatSelect.value;
+  const agentic = agenticToggle && agenticToggle.checked;
 
   if (!uid)   { appendMsg('⚠️ Enter a User ID in the top bar first.'); return; }
   if (!query) return;
@@ -1239,6 +1274,31 @@ async function sendQuery() {
   queryInput.value = '';
   setLoading(true);
   showTyping();
+
+  // Agentic mode (text only): planner → workers → synthesizer with an on-screen trace.
+  if (agentic && fmt === 'text') {
+    try {
+      const res = await fetch(`${BASE_URL}/ask/multiagent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: uid, query }),
+      });
+      removeTyping();
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      appendMsg(data.answer || 'No response returned.');
+      renderTrace(data.plan, data.trace, data.reflection, data.guardrail);
+    } catch (e) {
+      removeTyping();
+      appendMsg(`⚠️ ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+    return;
+  }
 
   try {
     const res = await fetch(`${BASE_URL}/ask`, {

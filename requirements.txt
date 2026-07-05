@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 groq
+mcp>=1.2.0
 pandas
 fpdf2
 openpyxl

@@ -1,0 +1,47 @@
+{
+  "FAC001": [
+    {
+      "ts": "2026-07-05T16:59:43+00:00",
+      "role": "faculty",
+      "query": "How many students do I mentor and what is their average attendance?",
+      "answer": "You mentor 111 students and their average attendance is 96.0%.",
+      "tool_calls": [
+        "list_my_students",
+        "get_class_average"
+      ]
+    }
+  ],
+  "ADM001": [
+    {
+      "ts": "2026-07-05T16:59:44+00:00",
+      "role": "admin",
+      "query": "What is the CGPA and backlog count of student 1NT23IS125?",
+      "answer": "The CGPA of student 1NT23IS125 is 8.29, and the student has 0 backlogs.",
+      "tool_calls": [
+        "get_grades",
+        "get_backlogs"
+      ]
+    }
+  ],
+  "1NT23IS015": [
+    {
+      "ts": "2026-07-05T17:08:10+00:00",
+      "role": "student",
+      "query": "What is my attendance?",
+      "answer": "Your attendance is 94.0%.",
+      "tool_calls": [
+        "get_attendance"
+      ]
+    },
+    {
+      "ts": "2026-07-05T17:15:41+00:00",
+      "role": "student",
+      "query": "am i above average in class",
+      "answer": "Based on the available data, your current CGPA is 8.5, and the class average grade is 7.81. Since your CGPA (8.5) is higher than the class average (7.81), you are above average in your class.",
+      "tool_calls": [
+        "get_grades",
+        "get_class_average"
+      ]
+    }
+  ]
+}

@@ -9,3 +9,4 @@ finalyear/
 data/mentor_assignments.json 
 *.sql 
 peek_report.txt 
+virtual/
